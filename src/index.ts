@@ -1,113 +1,56 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
+import 'dotenv/config';
 import { readConfig } from './config.js';
-import { computeHealthScore, shouldPauseStrategy, overallRiskScore } from './health.js';
-import { allocateCapital, calculatePortfolioState } from './allocator.js';
-import { calculateReinvestment, shouldReinvest } from './reinvestment.js';
-import type { StrategySnapshot } from './types.js';
+import { resetKillSwitch, runCycle } from './cycle.js';
+import { emitEvent } from './mm-contract.js';
 
-async function ensureFile(filePath: string, fallback: unknown) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  try {
-    await fs.access(filePath);
-  } catch {
-    await fs.writeFile(filePath, JSON.stringify(fallback, null, 2), 'utf8');
-  }
+const args = process.argv.slice(2);
+
+async function fatal(err: unknown): Promise<never> {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[orchestrator] fatal: ${message}`);
+  await emitEvent({ source: 'orchestrator', level: 'error', type: 'fatal', message });
+  process.exit(1);
 }
 
-async function readJson<T>(filePath: string, fallback: T): Promise<T> {
-  await ensureFile(filePath, fallback);
-  try {
-    const content = await fs.readFile(filePath, 'utf8');
-    return JSON.parse(content) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeJson(filePath: string, value: unknown) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(value, null, 2), 'utf8');
-}
-
-async function runCycle() {
-  const config = readConfig();
-  const strategyPath = config.strategyHealthPath;
-  const allocationPath = config.allocationPath;
-  const portfolioPath = config.portfolioStatePath;
-
-  const strategies = await readJson<StrategySnapshot[]>(strategyPath, [
-    {
-      name: 'solana-trader',
-      status: 'active',
-      capital: 2000,
-      totalReturn: 0.18,
-      winRate: 0.68,
-      avgProfit: 0.08,
-      drawdown: 0.12,
-      healthScore: 82,
-      lastUpdated: new Date().toISOString(),
-    },
-    {
-      name: 'liquidation-hunter',
-      status: 'active',
-      capital: 1800,
-      totalReturn: 0.24,
-      winRate: 0.8,
-      avgProfit: 0.12,
-      drawdown: 0.08,
-      healthScore: 88,
-      lastUpdated: new Date().toISOString(),
-    },
-    {
-      name: 'arbitrage-bot',
-      status: 'paused',
-      capital: 500,
-      totalReturn: 0.02,
-      winRate: 0.5,
-      avgProfit: 0.03,
-      drawdown: 0.22,
-      healthScore: 48,
-      lastUpdated: new Date().toISOString(),
-    },
-  ]);
-
-  const overallRisk = overallRiskScore(strategies);
-  const paused = strategies.filter((s) => shouldPauseStrategy(s, config.minHealthScore));
-
-  for (const strategy of paused) {
-    console.log(`Pause: ${strategy.name} due to health gate`);
-    strategy.status = 'paused';
-  }
-
-  const allocations = allocateCapital(strategies, config.totalCapital, config.riskProfile);
-  const state = calculatePortfolioState(strategies, config.totalCapital, config.maxPortfolioDrawdown, config.maxStrategyExposure);
-  const portfolioDrawdown = state.drawdown;
-
-  const netProfit = 250;
-  if (shouldReinvest(netProfit, config.totalCapital, portfolioDrawdown, config.maxPortfolioDrawdown)) {
-    const reinvestment = calculateReinvestment(strategies, netProfit, config.reinvestmentPercent, config.minHealthScore);
-    for (const item of reinvestment) {
-      console.log(`Reinvest: ${item.strategy} +$${item.amount.toFixed(2)}`);
-    }
-  }
-
-  console.log(`Portfolio risk: ${overallRisk.toFixed(2)}`);
-  console.log(`Portfolio drawdown: ${portfolioDrawdown.toFixed(2)}`);
-  console.log('Allocations:');
-  for (const [name, amount] of Object.entries(allocations)) {
-    console.log(`- ${name}: $${amount.toFixed(2)}`);
-  }
-
-  await writeJson(allocationPath, allocations);
-  await writeJson(portfolioPath, state);
-
-  const interval = config.pollIntervalMs;
-  console.log(`Next cycle in ${interval} ms\n`);
-  if (process.argv.includes('--once')) {
+async function main(): Promise<void> {
+  if (args.includes('--reset-kill-switch')) {
+    await resetKillSwitch();
+    console.log('[orchestrator] drawdown kill switch reset; high-water mark re-anchors next cycle');
     return;
   }
-  setTimeout(runCycle, interval);
+
+  const config = readConfig(); // throws ConfigError on invalid env -> exit 1
+  if (args.includes('--once')) {
+    await runCycle(config);
+    return;
+  }
+
+  console.log(`[orchestrator] loop mode, interval ${config.pollIntervalMs} ms`);
+  let stopping = false;
+  let wake: (() => void) | undefined;
+  const stop = () => {
+    stopping = true;
+    wake?.();
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+  while (!stopping) {
+    try {
+      await runCycle(config);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[orchestrator] cycle failed: ${message}`);
+      await emitEvent({ source: 'orchestrator', level: 'error', type: 'cycle-failed', message });
+    }
+    if (stopping) break;
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, config.pollIntervalMs);
+      wake = () => {
+        clearTimeout(t);
+        resolve();
+      };
+    });
+  }
 }
 
-await runCycle();
+main().catch(fatal);
