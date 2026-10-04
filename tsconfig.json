@@ -5,8 +5,10 @@
     "moduleResolution": "NodeNext",
     "esModuleInterop": true,
     "strict": true,
+    "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
+    "noEmit": true,
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
